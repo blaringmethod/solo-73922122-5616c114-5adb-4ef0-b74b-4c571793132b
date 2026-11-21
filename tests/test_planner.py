@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 import random
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -131,3 +132,82 @@ def test_lexicographic_tie_break():
     result = plan_partitions(stations, 2, 100)
     assert [p["station_ids"] for p in result["partitions"]] == [[1, 2], [3]]
     assert result["reused_ranges"] == [{"start_station": 1, "end_station": 2}]
+
+
+# ------------------------------------------------- current-range verification
+def test_ranges_accept_gaps_in_station_ids():
+    # Ids 1, 5, 6, 10: gaps are fine as long as each range is anchored on
+    # registered stations and covers exactly the registered stations in between.
+    stations = [
+        Station(1, 10, current_start=1, current_end=1),
+        Station(5, 10, current_start=5, current_end=6),
+        Station(6, 10, current_start=5, current_end=6),
+        Station(10, 10),
+    ]
+    ranges = build_source_ranges(stations)
+    by_start = {r.start_station: r for r in ranges.values()}
+    assert sorted(by_start) == [1, 5]
+    assert by_start[1].station_ids == (1,)
+    assert by_start[5].station_ids == (5, 6)
+
+
+def test_range_endpoints_must_be_registered_stations():
+    # Endpoints 1 and 3, but station 3 was never registered.
+    stations = [
+        Station(1, 10, current_start=1, current_end=3),
+        Station(2, 10, current_start=1, current_end=3),
+        Station(4, 10),
+    ]
+    with pytest.raises(ValueError, match="endpoints must be known stations"):
+        build_source_ranges(stations)
+
+
+def test_range_must_exactly_cover_registered_stations_inside_it():
+    # Station 2 falls inside 1-3 but declares no range: coverage is not exact.
+    stations = [
+        Station(1, 10, current_start=1, current_end=3),
+        Station(2, 10),
+        Station(3, 10, current_start=1, current_end=3),
+    ]
+    with pytest.raises(ValueError, match="not contiguous|exactly cover"):
+        build_source_ranges(stations)
+
+    # A range must not include an undeclared "hole" even when ids are dense.
+    stations = [
+        Station(1, 10, current_start=1, current_end=4),
+        Station(2, 10, current_start=1, current_end=4),
+        Station(3, 10),
+        Station(4, 10, current_start=1, current_end=4),
+    ]
+    with pytest.raises(ValueError):
+        build_source_ranges(stations)
+
+
+def test_overlapping_ranges_are_rejected():
+    # Each station may live in exactly one file; overlapping declarations can
+    # never be contiguous ranges.
+    stations = [
+        Station(1, 10, current_start=1, current_end=2),
+        Station(2, 10, current_start=1, current_end=2),
+        Station(3, 10, current_start=2, current_end=3),
+    ]
+    with pytest.raises(ValueError):
+        build_source_ranges(stations)
+
+
+def test_range_verification_is_linear_not_a_rescan_per_range():
+    # 20k stations grouped into 5k ranges of four: an O(ranges * stations)
+    # implementation spends minutes here; the linear pass stays well under a
+    # second.
+    n = 20_000
+    stations = []
+    for sid in range(1, n + 1):
+        block_start = ((sid - 1) // 4) * 4 + 1
+        stations.append(
+            Station(sid, 1, current_start=block_start, current_end=block_start + 3)
+        )
+    started = time.perf_counter()
+    ranges = build_source_ranges(stations)
+    elapsed = time.perf_counter() - started
+    assert len(ranges) == n // 4
+    assert elapsed < 2.0, f"range verification took {elapsed:.2f}s"

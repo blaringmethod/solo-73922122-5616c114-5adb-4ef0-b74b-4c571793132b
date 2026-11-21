@@ -4,6 +4,13 @@ Consistency rules
 -----------------
 * Source-manifest versions increase monotonically per day.  The highest version
   is the *current* one; only it may be planned against, confirmed or published.
+* Manifest registration is split in two phases: the potentially slow,
+  CPU-only range verification runs without any database lock, while version
+  allocation and every insert happen inside one short ``BEGIN IMMEDIATE``
+  transaction.  A large registration therefore never blocks publications of
+  other days on SQLite's single writer lock, and a failed verification rolls
+  back everything (no version advance, no partial stations, no supersession of
+  already published manifests).
 * A plan is immutable and is reused when the same source version and the same
   planning parameters are requested again.
 * A publication is created at most once per source version (DB unique
@@ -66,13 +73,70 @@ class RepartitionService:
                 f"manifest has {len(body.stations)} stations, limit is "
                 f"{self.max_stations_per_manifest}",
             )
+
+        # Phase 1: pure CPU work outside any database transaction.  Verifying a
+        # ~20k-station manifest can take a while; keeping it out of the write
+        # transaction means no SQLite write lock is held meanwhile, so plans and
+        # publications for *other days* (and this one) keep committing normally.
         station_in = sorted(body.stations, key=lambda st: st.station_id)
+        stations = [
+            Station(
+                station_id=item.station_id,
+                estimated_bytes=item.estimated_bytes,
+                current_start=(
+                    item.current_range.start_station
+                    if item.current_range
+                    else None
+                ),
+                current_end=(
+                    item.current_range.end_station
+                    if item.current_range
+                    else None
+                ),
+            )
+            for item in station_in
+        ]
+        try:
+            source_ranges = planner.build_source_ranges(stations)
+        except ValueError as exc:
+            raise ApiError(422, "invalid_current_ranges", str(exc)) from exc
+
+        total_bytes = sum(st.estimated_bytes for st in stations)
+        ranges_json = json.dumps(
+            [
+                {
+                    "start_station": r.start_station,
+                    "end_station": r.end_station,
+                    "bytes": r.bytes,
+                    "station_ids": list(r.station_ids),
+                }
+                for r in sorted(source_ranges.values(), key=lambda r: r.start_pos)
+            ],
+            ensure_ascii=False,
+        )
+        station_rows = [
+            (
+                pos,
+                st.station_id,
+                st.estimated_bytes,
+                st.current_start,
+                st.current_end,
+            )
+            for pos, st in enumerate(stations)
+        ]
+
+        # Phase 2: short write transaction.  Version numbers are decided at
+        # commit time, not during phase 1, so concurrent registrations cannot
+        # observe the same "current" version.  On any failure the whole
+        # transaction rolls back: no version advances, no partial stations
+        # remain, and previously published manifests stay untouched.
         conn = self._conn()
         try:
             with write_tx(conn):
                 current = self._current_manifest(conn, day)
                 current_version = current["version"] if current else 0
                 if body.version is not None:
+                    # Must still beat the version current at commit time.
                     if body.version <= current_version:
                         raise ApiError(
                             409,
@@ -83,54 +147,11 @@ class RepartitionService:
                         )
                     version = body.version
                 else:
+                    # Next version at the moment the row lands; serialised by
+                    # BEGIN IMMEDIATE, so two concurrent registrations can never
+                    # take the same number.
                     version = current_version + 1
-                existing = conn.execute(
-                    "SELECT * FROM source_manifests WHERE day = ? AND version = ?",
-                    (day, version),
-                ).fetchone()
-                if existing is not None:  # pragma: no cover - guarded above
-                    raise ApiError(
-                        409,
-                        "version_exists",
-                        f"version {version} already exists for day {day}",
-                    )
 
-                # Validate the declared current ranges as a whole before writing.
-                stations = [
-                    Station(
-                        station_id=item.station_id,
-                        estimated_bytes=item.estimated_bytes,
-                        current_start=(
-                            item.current_range.start_station
-                            if item.current_range
-                            else None
-                        ),
-                        current_end=(
-                            item.current_range.end_station
-                            if item.current_range
-                            else None
-                        ),
-                    )
-                    for item in station_in
-                ]
-                try:
-                    source_ranges = planner.build_source_ranges(stations)
-                except ValueError as exc:
-                    raise ApiError(422, "invalid_current_ranges", str(exc)) from exc
-
-                total_bytes = sum(st.estimated_bytes for st in stations)
-                ranges_json = json.dumps(
-                    [
-                        {
-                            "start_station": r.start_station,
-                            "end_station": r.end_station,
-                            "bytes": r.bytes,
-                            "station_ids": list(r.station_ids),
-                        }
-                        for r in sorted(source_ranges.values(), key=lambda r: r.start_pos)
-                    ],
-                    ensure_ascii=False,
-                )
                 superseded_publication = None
                 if current is not None:
                     superseded_publication = conn.execute(
@@ -158,20 +179,25 @@ class RepartitionService:
                     " current_start_station, current_end_station) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     [
-                        (
-                            manifest_id,
-                            pos,
-                            st.station_id,
-                            st.estimated_bytes,
-                            st.current_start,
-                            st.current_end,
-                        )
-                        for pos, st in enumerate(stations)
+                        (manifest_id, pos, station_id, size, start, end)
+                        for (pos, station_id, size, start, end) in station_rows
                     ],
                 )
+        except sqlite3.IntegrityError as exc:
+            # Backstop for an explicit version that lost a race against a
+            # concurrent registration which committed the same (day, version).
+            raise ApiError(
+                409,
+                "version_exists",
+                f"version {body.version if body.version is not None else version} "
+                f"already exists for day {day}",
+            ) from exc
         finally:
             conn.close()
 
+        # The new manifest (manifest row plus every station row) is fully
+        # committed before this point; only now do older plans/publications of
+        # the same day become stale under the normal supersession rules.
         return {
             "manifest": {
                 "id": manifest_id,

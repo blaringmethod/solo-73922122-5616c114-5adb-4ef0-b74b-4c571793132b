@@ -51,10 +51,20 @@ def build_source_ranges(stations: Sequence[Station]) -> dict[int, SourceRange]:
 
     Returns a mapping keyed by the range's end position.  Stations without a
     declared range are simply not reusable.
+
+    The check is linear: one ordered pass builds the id->position index and the
+    range groups, then each declared range is verified with O(1) work, so the
+    total cost is O(n + r) rather than a full re-scan of the station list per
+    range.  Station ids may have gaps; nevertheless every range must have
+    registered stations as both endpoints and must cover exactly the registered
+    stations whose ids fall inside it (equivalently: its stations form one
+    contiguous run in station order).
     """
 
+    by_id: dict[int, int] = {}
     grouped: dict[tuple[int, int], list[int]] = {}
     for pos, st in enumerate(stations):
+        by_id[st.station_id] = pos
         if st.current_start is None and st.current_end is None:
             continue
         if st.current_start is None or st.current_end is None:
@@ -66,34 +76,31 @@ def build_source_ranges(stations: Sequence[Station]) -> dict[int, SourceRange]:
                 f"station {st.station_id}: current_start {st.current_start} > "
                 f"current_end {st.current_end}"
             )
+        # Positions are appended in station order, so each group stays sorted.
         grouped.setdefault((st.current_start, st.current_end), []).append(pos)
 
-    by_id = {st.station_id: pos for pos, st in enumerate(stations)}
     ranges: dict[int, SourceRange] = {}
     for (start_id, end_id), positions in grouped.items():
-        if start_id not in by_id or end_id not in by_id:
+        start_pos = by_id.get(start_id)
+        end_pos = by_id.get(end_id)
+        if start_pos is None or end_pos is None:
             raise ValueError(
                 f"current range {start_id}-{end_id} endpoints must be known stations"
             )
-        positions.sort()
-        start_pos = positions[0]
-        end_pos = positions[-1]
-        expected = list(range(start_pos, end_pos + 1))
-        if positions != expected:
+        # Ids are unique and sorted, so the registered stations whose ids fall
+        # inside [start_id, end_id] are exactly the position slice
+        # stations[start_pos:end_pos + 1].  The range is valid iff the declaring
+        # stations are precisely that slice: contiguous positions, matching
+        # endpoints, and no in-between station missing from the declaration.
+        if (
+            positions[0] != start_pos
+            or positions[-1] != end_pos
+            or len(positions) != end_pos - start_pos + 1
+        ):
             raise ValueError(
-                f"current range {start_id}-{end_id} is not contiguous in station order"
-            )
-        # Every station whose id falls inside the declared range must belong to
-        # it; otherwise the declared Parquet file cannot cover the range exactly.
-        in_bounds = [p for p, st in enumerate(stations) if start_id <= st.station_id <= end_id]
-        if in_bounds != positions:
-            raise ValueError(
-                f"current range {start_id}-{end_id} does not exactly cover the "
-                f"stations whose ids fall inside it"
-            )
-        if positions[0] != by_id[start_id] or positions[-1] != by_id[end_id]:
-            raise ValueError(
-                f"current range {start_id}-{end_id} endpoints are out of order"
+                f"current range {start_id}-{end_id} is not contiguous in station "
+                f"order or does not exactly cover the stations whose ids fall "
+                f"inside it"
             )
         total = sum(stations[p].estimated_bytes for p in positions)
         ranges[end_pos] = SourceRange(
